@@ -110,7 +110,8 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
 // dst[n*ldd + m] = sum_k dequant(src0)[m*K + k] * src1[n*K + k], src1 is F32, F16 or BF16.
 // The XMX combination is picked per call from the src1 type and its precision request src1_prec
 // (op_params[3], [TAG_GGML_PREC]); the accumulator is f32, which meets any request.
-// q8_0 and the k-quants are not handled here, only in the grouped path below.
+// Q4_K/Q5_K also have a shared-A prefill tile for 64 < N <= 128.
+// q8_0 and the other k-quants are handled only in the grouped path below.
 // Returns false when the case is not handled (type, device, precision, or shape).
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, const void * src0, const void * src1, ggml_type src1_type,
                                   int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,

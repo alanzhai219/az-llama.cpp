@@ -843,9 +843,8 @@ template <> struct fg_soa<block_iq4_nl> : fg_soa_iq4<GGML_TYPE_IQ4_NL> {};
 template <> struct fg_soa<block_iq4_xs> : fg_soa_iq4<GGML_TYPE_IQ4_XS> {};
 
 
-// one SG_ROWS x BN output tile: B columns [b0, b0 + BN) of packed_b go to dst columns [n0, n1),
-// n1 - n0 <= BN
-template <typename S, typename block_q_t, bool reordered>
+// NSPLIT sub-groups share each decoded A tile across adjacent BN-wide output tiles.
+template <typename S, typename block_q_t, bool reordered, int NSPLIT = 1>
 static void fused_dequant_gemm_tile(
     const block_q_t * __restrict__ x,
     const typename S::tsb * __restrict__ packed_b,
@@ -864,7 +863,11 @@ static void fused_dequant_gemm_tile(
         const int  lane   = sg.get_local_id()[0];
         const int  m0     = item.get_group(1) * S::SG_ROWS;
         const int  nstep  = K / FG_BK;
-        const int  a_base = sg_id * S::SG_ROWS * FG_BK;
+        constexpr int KSPLIT = FG_KSPLIT / NSPLIT;
+        static_assert(FG_KSPLIT % NSPLIT == 0, "bad N split");
+        const int  split_k = sg_id / NSPLIT;
+        const int  split_n = sg_id % NSPLIT;
+        const int  a_base = split_k * S::SG_ROWS * FG_BK;
         const int  c_base = sg_id * S::SG_ROWS * S::BN;
 
         mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, S::TM, S::TN> acc[S::MT][S::NT];
@@ -878,6 +881,7 @@ static void fused_dequant_gemm_tile(
 
         // lane decodes rows lane, lane + SG, ... of the sub-group's SG_ROWS
         constexpr int         KPB     = fg_block_traits<block_q_t>::qk / FG_BK; // k steps per block
+        static_assert(NSPLIT == 1 || KPB % KSPLIT == 0, "shared A needs equal K loop counts");
         const size_t          bpr     = K / fg_block_traits<block_q_t>::qk;
         const size_t          nblocks = (size_t) M * bpr;
         size_t                row_blk[S::RPL];
@@ -895,26 +899,32 @@ static void fused_dequant_gemm_tile(
                                                     sycl::access::decorated::no>(packed_b);
         const int b_stride = Npad * S::VNNI;
 
-        const int kb_begin = (sg_id * nstep) / FG_KSPLIT;
-        const int kb_end   = ((sg_id + 1) * nstep) / FG_KSPLIT;
+        const int kb_begin = (split_k * nstep) / KSPLIT;
+        const int kb_end   = ((split_k + 1) * nstep) / KSPLIT;
         for (int kb = kb_begin; kb < kb_end; ++kb) {
+            if (split_n == 0) {
 #pragma unroll
-            for (int r = 0; r < S::RPL; ++r) {
-                if (row_ok[r]) {
-                    if constexpr (reordered) {
-                        fg_soa<block_q_t>::template stage<EA>((const uint8_t *) x, nblocks, row_blk[r] + kb / KPB, kb,
-                                                              a[r]);
+                for (int r = 0; r < S::RPL; ++r) {
+                    if (row_ok[r]) {
+                        if constexpr (reordered) {
+                            fg_soa<block_q_t>::template stage<EA>((const uint8_t *) x, nblocks, row_blk[r] + kb / KPB, kb,
+                                                                  a[r]);
+                        } else {
+                            fg_stage_a<EA>(x + row_blk[r], kb, a[r]);
+                        }
                     } else {
-                        fg_stage_a<EA>(x + row_blk[r], kb, a[r]);
-                    }
-                } else {
 #pragma unroll
-                    for (int j = 0; j < FG_BK / 2; ++j) {
-                        a[r][j] = EA::make(0.0f, 0.0f);
+                        for (int j = 0; j < FG_BK / 2; ++j) {
+                            a[r][j] = EA::make(0.0f, 0.0f);
+                        }
                     }
                 }
             }
-            sycl::group_barrier(sg);
+            if constexpr (NSPLIT == 1) {
+                sycl::group_barrier(sg);
+            } else {
+                sycl::group_barrier(item.get_group());
+            }
 
 #pragma unroll
             for (int kt = 0; kt < FG_BK / S::TK; ++kt) {
@@ -922,7 +932,7 @@ static void fused_dequant_gemm_tile(
                 mx::joint_matrix<sycl::sub_group, TB, mx::use::b, S::TK, S::TN, S::b_layout> sub_b[S::NT];
 #pragma unroll
                 for (int nt = 0; nt < S::NT; ++nt) {
-                    mx::joint_matrix_load(sg, sub_b[nt], b_ptr + (size_t) kq0 * b_stride + (b0 + nt * S::TN) * S::VNNI, b_stride);
+                    mx::joint_matrix_load(sg, sub_b[nt], b_ptr + (size_t) kq0 * b_stride + (b0 + split_n * S::BN + nt * S::TN) * S::VNNI, b_stride);
                 }
 #pragma unroll
                 for (int mt = 0; mt < S::MT; ++mt) {
@@ -937,7 +947,11 @@ static void fused_dequant_gemm_tile(
                 }
             }
             // the next step overwrites tile_a
-            sycl::group_barrier(sg);
+            if constexpr (NSPLIT == 1) {
+                sycl::group_barrier(sg);
+            } else {
+                sycl::group_barrier(item.get_group());
+            }
         }
 
 #pragma unroll
@@ -952,7 +966,7 @@ static void fused_dequant_gemm_tile(
         sycl::group_barrier(item.get_group());
 
         // sum the K splits; consecutive lanes write consecutive rows of one dst column
-        for (int idx = item.get_local_linear_id(); idx < S::SG_ROWS * S::BN; idx += S::WG_SIZE) {
+        for (int idx = item.get_local_linear_id(); idx < S::SG_ROWS * S::BN * NSPLIT; idx += S::WG_SIZE) {
             const int r = idx % S::SG_ROWS;
             const int c = idx / S::SG_ROWS;
             const int m = m0 + r;
@@ -960,8 +974,8 @@ static void fused_dequant_gemm_tile(
             if (m < M && n < n1) {
                 float sum = 0.0f;
 #pragma unroll
-                for (int s = 0; s < FG_KSPLIT; ++s) {
-                    sum += tile_c[s * S::SG_ROWS * S::BN + r * S::BN + c];
+                for (int s = 0; s < KSPLIT; ++s) {
+                    sum += tile_c[(s * NSPLIT + c / S::BN) * S::SG_ROWS * S::BN + r * S::BN + c % S::BN];
                 }
                 if (dst_rows.map) {
                     const mmid_row_mapping row = dst_rows.map[n];
@@ -975,18 +989,18 @@ static void fused_dequant_gemm_tile(
     }
 }
 
-template <typename S, typename block_q_t, bool reordered = false>
+template <typename S, typename block_q_t, bool reordered = false, int NSPLIT = 1>
 static void fused_dequant_gemm_launch(const void * src0, const typename S::tsb * packed, float * dst, const int M,
                                       const int N, const int Npad, const int K, const int ldd,
                                       const int64_t groups_n, const int64_t groups_m, dpct::queue_ptr stream) {
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<typename S::tsa, 1> tile_a(FG_KSPLIT * S::SG_ROWS * FG_BK, cgh);
+        sycl::local_accessor<typename S::tsa, 1> tile_a((FG_KSPLIT / NSPLIT) * S::SG_ROWS * FG_BK, cgh);
         sycl::local_accessor<float, 1>          tile_c(FG_KSPLIT * S::SG_ROWS * S::BN, cgh);
         cgh.parallel_for(
             sycl::nd_range<2>(sycl::range<2>(groups_n, groups_m * S::WG_SIZE), sycl::range<2>(1, S::WG_SIZE)),
             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(S::SG)]] {
-                const int n0 = item.get_group(0) * S::BN;
-                fused_dequant_gemm_tile<S, block_q_t, reordered>((const block_q_t *) src0, packed, dst, M, Npad, K,
+                const int n0 = item.get_group(0) * S::BN * NSPLIT;
+                fused_dequant_gemm_tile<S, block_q_t, reordered, NSPLIT>((const block_q_t *) src0, packed, dst, M, Npad, K,
                                                       ldd, n0, n0, N, tile_a, tile_c, item);
             });
     });
@@ -1063,6 +1077,10 @@ template <typename T> static constexpr bool fg_plain_ok() {
     return !std::is_same_v<T, block_q8_0> && !std::is_same_v<T, block_q2_K> && !std::is_same_v<T, block_q3_K> &&
            !std::is_same_v<T, block_q4_K> && !std::is_same_v<T, block_q5_K> &&
            !std::is_same_v<T, block_q6_K>;
+}
+
+template <typename T> static constexpr bool fg_prefill_ok() {
+    return std::is_same_v<T, block_q4_K> || std::is_same_v<T, block_q5_K>;
 }
 
 template <typename T, bool R> struct fg_tag {
@@ -1143,13 +1161,13 @@ static int fg_esimd_remap(dpct::queue_ptr stream, int combo, ggml_type src0_type
     return target;
 }
 
-template <typename S>
+template <typename S, int NSPLIT = 1>
 static bool fg_fused_run(ggml_type src0_type, bool src0_reordered, const void * src0, const void * src1, ggml_type src1_type,
                          float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd, ggml_sycl_pool & pool,
                          dpct::queue_ptr stream) {
-    const int64_t groups_n = (N + S::BN - 1) / S::BN;
+    const int64_t groups_n = (N + S::BN * NSPLIT - 1) / (S::BN * NSPLIT);
     const int64_t groups_m = (M + S::SG_ROWS - 1) / S::SG_ROWS;
-    const int     Npad     = (int) (groups_n * S::BN);
+    const int     Npad     = (int) (groups_n * S::BN * NSPLIT);
 
     // src1 is read in its own type: one pass, converted in registers only if B differs
     ggml_sycl_pool_alloc<typename S::tsb> packed_b(pool, (size_t) K * Npad);
@@ -1164,8 +1182,8 @@ static bool fg_fused_run(ggml_type src0_type, bool src0_reordered, const void * 
     const typename S::tsb * packed = packed_b.get();
     return fg_visit_type(src0_type, src0_reordered, [&](auto tag) {
         using block_q_t = typename decltype(tag)::type;
-        if constexpr (fg_plain_ok<block_q_t>()) {
-            fused_dequant_gemm_launch<S, block_q_t, decltype(tag)::reordered>(src0, packed, dst, (int) M, (int) N,
+        if constexpr ((NSPLIT == 1 && fg_plain_ok<block_q_t>()) || (NSPLIT > 1 && fg_prefill_ok<block_q_t>())) {
+            fused_dequant_gemm_launch<S, block_q_t, decltype(tag)::reordered, NSPLIT>(src0, packed, dst, (int) M, (int) N,
                                                                               Npad, (int) K, (int) ldd, groups_n,
                                                                               groups_m, stream);
         }
@@ -1175,7 +1193,10 @@ static bool fg_fused_run(ggml_type src0_type, bool src0_reordered, const void * 
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, const void * src0, const void * src1, ggml_type src1_type,
                                   int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
                                   ggml_sycl_pool & pool, dpct::queue_ptr stream) {
-    // every BN columns dequantize A again, so wide N is left to the library GEMM.
+    // Q6_K stays on the library path: shared A regresses long-K dense GEMM.
+    const bool prefill = (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K) &&
+                        N > GGML_SYCL_FG_MAX_N && N <= 128;
+    // The prefill tile shares A across N; other dense formats keep the narrow gate.
     // src0_reordered: the persistent weight reorder may have been installed on this
     // tensor by an earlier small-batch mul_mat; the A stage then has to decode the
     // SoA layout. Types without an SoA stage (fg_soa<T>::supported == false)
@@ -1184,13 +1205,13 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, cons
     bool plain_ok = false;
     fg_visit_type(src0_type, src0_reordered, [&](auto tag) { plain_ok = fg_plain_ok<typename decltype(tag)::type>(); });
     if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
-        !ggml_sycl_xmx_gather_type_enabled(src0_type) || !plain_ok) {
+        !ggml_sycl_xmx_gather_type_enabled(src0_type) || (!plain_ok && !prefill)) {
         return false;
     }
     if (src1_type != GGML_TYPE_F32 && src1_type != GGML_TYPE_F16 && src1_type != GGML_TYPE_BF16) {
         return false;
     }
-    if (!ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, N, K, ldd)) {
+    if (!ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, prefill ? 1 : N, K, ldd)) {
         return false;
     }
     const int combo = fg_pick_combo(stream, src1_type, src1_prec);
@@ -1199,7 +1220,15 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, cons
     }
     bool launched = false;
     fg_visit_combo(combo, [&](auto s) {
-        launched = fg_fused_run<decltype(s)>(src0_type, src0_reordered, src0, src1, src1_type, dst, M, N, K, ldd, pool, stream);
+        using S = decltype(s);
+        if (prefill) {
+            if constexpr (S::SG == 16 && S::efficient && std::is_same_v<typename S::ta, fg_half> &&
+                          std::is_same_v<typename S::tb, fg_half>) {
+                launched = fg_fused_run<S, 4>(src0_type, src0_reordered, src0, src1, src1_type, dst, M, N, K, ldd, pool, stream);
+            }
+        } else {
+            launched = fg_fused_run<S>(src0_type, src0_reordered, src0, src1, src1_type, dst, M, N, K, ldd, pool, stream);
+        }
     });
     return launched;
 }
