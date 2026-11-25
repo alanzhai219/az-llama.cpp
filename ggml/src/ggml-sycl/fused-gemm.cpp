@@ -5,6 +5,7 @@
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <tuple>
 #include <mutex>
@@ -1190,12 +1191,34 @@ static bool fg_fused_run(ggml_type src0_type, bool src0_reordered, const void * 
     });
 }
 
+static bool fg_prefill_device_preferred(dpct::queue_ptr stream) {
+    bool env_set = std::getenv("GGML_SYCL_FG_ENABLE") != nullptr;
+    if (env_set) {
+        return std::atoi(std::getenv("GGML_SYCL_FG_ENABLE")) != 0;
+    }
+    return false;
+    /*
+    const auto & info = ggml_sycl_info();
+    const auto   id   = dpct::dev_mgr::instance().get_device_id(stream->get_device());
+    if (id >= (unsigned int) info.device_count || id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    const auto & device = info.devices[id];
+    // Shared A reduces dequantization work, but adds work-group barriers. Keep dGPUs on the library path.
+    if (device.l0_device_type_valid) {
+        return !device.l0_discrete_gpu;
+    }
+    return device.hw_info.gpu_family == GPU_FAMILY_IGPU_NON_XE ||
+           device.hw_info.gpu_family == GPU_FAMILY_IGPU_XE;
+    */
+}
+
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, bool src0_reordered, const void * src0, const void * src1, ggml_type src1_type,
                                   int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
                                   ggml_sycl_pool & pool, dpct::queue_ptr stream) {
     // Q6_K stays on the library path: shared A regresses long-K dense GEMM.
     const bool prefill = (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K) &&
-                        N > GGML_SYCL_FG_MAX_N && N <= 128;
+                        N > GGML_SYCL_FG_MAX_N && N <= 128 && fg_prefill_device_preferred(stream);
     // The prefill tile shares A across N; other dense formats keep the narrow gate.
     // src0_reordered: the persistent weight reorder may have been installed on this
     // tensor by an earlier small-batch mul_mat; the A stage then has to decode the
